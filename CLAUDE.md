@@ -124,6 +124,56 @@ claims. Rationale and questionnaire answers live in
 
 ---
 
+## Project tooling agents
+
+These specialist agents live in `.claude/agents/` and should be invoked
+proactively when their trigger conditions are met. Use the `Agent` tool
+with the matching `subagent_type`.
+
+### Lifecycle agents
+
+Fire on git activity / development phases.
+
+| Agent | Trigger — when to invoke |
+|---|---|
+| `threat-modeler` | Beginning of any feature touching auth, sessions, PII/credentials/tokens, secrets, network exposure, file uploads, untrusted deserialization, third-party integrations, or multi-tenant code paths. Pre-implementation only — design / plan / scaffold stage. |
+| `infra-reviewer` | Before applying any Terraform / Kubernetes / Helm / Ansible-on-infra change with broad blast radius. Always invoke when the diff touches PVCs, StatefulSets, network policies, IAM, secrets, storage classes, `*.tfvars` / `*.tfvars.json`, or Helm values files. |
+| `anti-pattern-detector` | After completing a feature or refactor, before final review. Also: end-of-session pass to catch anything missed during inline work. Also when the user asks "is this approach right?" / "any concerns with this?". Distinct from `infra-reviewer` (gates pre-apply infra) and `code-reviewer` (checks plan adherence). |
+| `coverage-checker` | After modifying code in a module that has an enforced coverage threshold. Run *before committing*, not just before merging — catches "passes locally but CI fails" earlier. Detect by JaCoCo / nyc / vitest / coverage.py / SimpleCov / cargo-tarpaulin config. |
+| `vulnerability-scanner` | After any dependency lock change (`package-lock.json`, `pnpm-lock.yaml`, `Pipfile.lock`, `poetry.lock`, `Gemfile.lock`, `Cargo.lock`, `go.sum`, Maven/Gradle BOM updates). Periodic weekly sweep on default branch. When a high-profile CVE is announced. |
+| `ansible-role-tester` | After creating or modifying any Ansible role under `roles/`, `ansible/roles/`, or `infra/ansible/roles/`. Writes Molecule + testinfra coverage. |
+| `script-extractor` | End of a session that produced ≥1 useful multi-step shell pipeline, diagnostic incantation, or repeated-with-variations command. Watch user-typed `! <cmd>` shell snippets too — those are exactly the "I just did this manually and might do it again" candidates. Promotes them to maintained `bin/` scripts. |
+| `retrospective` | End of a long or substantive session, after a non-trivial milestone ships, or when the user explicitly asks "what did we learn?". Captures durable lessons + project facts + follow-ups. |
+
+### Reactive agents
+
+Fire on incident or schedule, not on git activity.
+
+| Agent | Trigger — when to invoke |
+|---|---|
+| `opensearch-diag` | When the OpenSearch / Elasticsearch logging stack misbehaves: ingestion lag, cluster yellow/red, dashboards unreachable, disk-pressure alerts, ISM/ILM not rotating indices. Also: proactively if the stack hasn't been queried in N days (drift detection). |
+| `incident-recorder` | After an outage, cascade, surprising failure, or near-miss. Bar is *surprise + meaningful cost*. Captures timeline, root cause, contributing factors, fix, lesson. Distinct from `retrospective` — that's general session reflection; `incident-recorder` is for events with material impact. |
+
+### Lifecycle diagram
+
+```
+   design ─→ implement ─→ self-review ─→ pre-apply ─→ ship ─→ retrospect
+     │            │             │             │          │         │
+  threat-     anti-pattern   coverage      infra      anything   retrospective
+  modeler     detector       checker       reviewer   shipped?   + script-
+              + ansible-     + vuln-                  → vuln     extractor
+              role-tester    scanner                  scanner
+
+  Reactive bench (fires on incident, not lifecycle):
+    opensearch-diag   incident-recorder
+```
+
+When invoking, pass enough context for the agent to act without asking
+clarifying questions: which files changed, what the goal is, and any
+project-specific constraints not visible from the diff alone.
+
+---
+
 ## Why these defaults
 
 Each directive maps to a specific cognitive lever (working-memory load,
