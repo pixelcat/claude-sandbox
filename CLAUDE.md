@@ -130,6 +130,35 @@ These specialist agents live in `.claude/agents/` and should be invoked
 proactively when their trigger conditions are met. Use the `Agent` tool
 with the matching `subagent_type`.
 
+**Auto-fire policy.** When a trigger condition listed below is *unambiguously*
+met, invoke the agent without asking the user first. The cost of an unnecessary
+review pass is small (a few minutes of agent time, plus a confirming "no
+findings" report); the cost of a skipped review on a real defect is large
+(security holes shipped, infra outages, latent anti-patterns compounding).
+**Bias toward firing.** Tell the user *that* you're firing the agent, not
+*whether* to fire it.
+
+The unambiguous triggers — fire automatically, no confirmation needed:
+
+- **`infra-reviewer`** — any planned Terraform / Kubernetes / Helm /
+  Ansible-on-infra diff that touches PVCs, StatefulSets, network policies,
+  IAM, secrets, storage classes, ingress, `*.tfvars`, or Helm values.
+  Including during plan-mode planning, not just at execution time.
+- **`threat-modeler`** — design-stage planning that touches auth, sessions,
+  credentials/tokens/API keys, secrets handling, network exposure (new
+  ingress, new public endpoint), file uploads, untrusted deserialization,
+  or third-party integrations. **At plan time, not at execution time.**
+- **`anti-pattern-detector`** — after a feature/refactor lands, AND at the
+  end of a substantive design plan that contains step-by-step implementation
+  guidance.
+- **`coverage-checker`** — after modifying any file under a module with an
+  enforced coverage threshold, before committing.
+- **`vulnerability-scanner`** — after any dependency lock change.
+
+For triggers that include judgment ("end of substantive session,"
+"when user asks 'is this right?'"), still fire proactively but state
+the judgment call you're making.
+
 ### Lifecycle agents
 
 Fire on git activity / development phases.
