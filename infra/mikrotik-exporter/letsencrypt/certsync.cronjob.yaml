@@ -1,0 +1,131 @@
+# Runs the cert-sync script daily. cert-manager renews the cert ~30 days out;
+# this job is what actually gets each renewal onto the routers. A daily run
+# means a renewal lands within 24h, well inside the 30-day window. The script
+# is a no-op when the router already has the current cert.
+#
+# Prod hardening: bake paramiko into your own image instead of pip-installing
+# at runtime (the pip step needs egress to PyPI, which the NetworkPolicy below
+# otherwise blocks — uncomment the PyPI egress or use a prebuilt image).
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: mktxp-certsync
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/name: mktxp-certsync
+    app.kubernetes.io/part-of: mikrotik-monitoring
+spec:
+  schedule: "17 3 * * *"   # daily 03:17
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      activeDeadlineSeconds: 600
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/name: mktxp-certsync
+        spec:
+          restartPolicy: Never
+          automountServiceAccountToken: false
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            runAsGroup: 1000
+            fsGroup: 1000
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: certsync
+              image: python:3.12-slim
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: ["ALL"]
+              command: ["/bin/sh", "-c"]
+              args:
+                - |
+                  set -e
+                  pip install --no-cache-dir --quiet paramiko
+                  exec python /app/sync.py
+              env:
+                - name: ROUTER_HOSTS
+                  value: "doohickey.internal.dployr.com,gizmo.internal.dployr.com,gadget.internal.dployr.com"
+                - name: ROUTER_USER
+                  valueFrom:
+                    secretKeyRef:
+                      name: mktxp-certsync-ssh
+                      key: username
+                - name: ROUTER_PASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: mktxp-certsync-ssh
+                      key: password
+                      optional: true
+                # If using key auth, point at the mounted key and clear
+                # ROUTER_PASSWORD in the Secret.
+                - name: ROUTER_SSH_KEY
+                  value: ""     # e.g. /ssh/ssh-privatekey (see volume below)
+                - name: HOME
+                  value: /tmp
+                - name: PIP_CACHE_DIR
+                  value: /tmp/pip
+              volumeMounts:
+                - name: tls
+                  mountPath: /tls
+                  readOnly: true
+                - name: script
+                  mountPath: /app
+                  readOnly: true
+                - name: tmp
+                  mountPath: /tmp
+          volumes:
+            - name: tls
+              secret:
+                secretName: mikrotik-api-tls
+                items:
+                  - key: tls.crt
+                    path: tls.crt
+                  - key: tls.key
+                    path: tls.key
+            - name: script
+              configMap:
+                name: mktxp-certsync-script
+            - name: tmp
+              emptyDir: {}
+---
+# Egress for the cert-sync pod: SSH to the routers + DNS. Uncomment the PyPI
+# block only if you pip-install at runtime (a prebuilt image is preferred).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: mktxp-certsync-egress
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/part-of: mikrotik-monitoring
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: mktxp-certsync
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - ipBlock:
+            cidr: 10.0.0.0/24   # <-- REPLACE with router mgmt CIDR
+      ports:
+        - port: 22
+          protocol: TCP
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+    # - {}   # <-- uncomment to allow all egress (needed for runtime pip)

@@ -1,0 +1,22 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Deployable manifests. The *.example.yaml Secrets are intentionally NOT
+# listed here — create those out-of-band (kubectl / ESO / SOPS) so plaintext
+# credentials never flow through a tracked kustomize build. See README.
+#
+# No global `namespace:` transformer on purpose: the ClusterIssuer is
+# cluster-scoped and each namespaced object already declares its namespace.
+resources:
+  - namespace.yaml
+  - mktxp-global.configmap.yaml
+  - deployment.yaml
+  - service.yaml
+  - servicemonitor.yaml
+  - networkpolicy.yaml
+  - grafana-dashboard.configmap.yaml
+  # Let's Encrypt (requires cert-manager CRDs already installed):
+  - letsencrypt/clusterissuer-letsencrypt-dns01.yaml
+  - letsencrypt/certificate-mikrotik-api.yaml
+  - letsencrypt/certsync-script.configmap.yaml
+  - letsencrypt/certsync.cronjob.yaml
