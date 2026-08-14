@@ -1,0 +1,35 @@
+# profiles/ops.conf — ELK (Elasticsearch 8) to OpenSearch 3.3.2
+#
+# Copy to ops.conf and fill in. Never commit the real file: it names internal
+# hosts and paths to credential files.
+#
+# Sourced by es-to-opensearch-migrate as a shell fragment.
+
+# ------------------------------------------------------------------ source
+SRC_URL='https://ops.internal:9200'
+SRC_NETRC="$HOME/.netrc.ops"          # mode 600 or 400, enforced at preflight
+SRC_CA='/etc/pki/ops-ca.crt'
+
+# ------------------------------------------------------------------ target
+DST_URL='https://ops-new.internal:9200'
+DST_NETRC="$HOME/.netrc.ops-new"
+DST_CA='/etc/pki/ops-new-ca.crt'
+
+# Checked against the live target at preflight. A mismatch warns and the live
+# version wins for compatibility rules.
+DST_VERSION_EXPECTED='3.3.2'
+
+# ------------------------------------------------------------------- notes
+#
+# Backfill engine: Logstash.
+#   Remote reindex from an ES 8 source into OpenSearch is fragile (version
+#   parsing and REST compatibility headers), and it would put scroll-and-fetch
+#   load on data nodes that are serving production after cutover.
+#
+# Cutover mechanism: Logstash output change.
+#   The elasticsearch output plugin rejects OpenSearch outright (product-origin
+#   check, 7.14+). logstash-output-opensearch must be installed first.
+#
+# Dashboards: rebuild.
+#   Kibana 8 saved objects do not import into OpenSearch Dashboards. Export
+#   them anyway and pass --saved-objects to size the work.

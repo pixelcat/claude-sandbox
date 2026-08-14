@@ -1,0 +1,6 @@
+# Real profiles name internal hosts and credential paths.
+profiles/*.conf
+!profiles/*.conf.example
+
+# Run artefacts: audit logs, raw captures, reports.
+run-*/

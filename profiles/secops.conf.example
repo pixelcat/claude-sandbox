@@ -1,0 +1,43 @@
+# profiles/secops.conf — Wazuh 4.5.4 on Elasticsearch 7 to Wazuh 4.14.7 on
+#                        OpenSearch 2.19.5
+#
+# Copy to secops.conf and fill in. Never commit the real file.
+
+# ------------------------------------------------------------------ source
+SRC_URL='https://10.9.9.4:9200'
+SRC_NETRC="$HOME/.netrc.secops"
+SRC_CA='/etc/logstash/certs/ca/ca.crt'
+
+# ------------------------------------------------------------------ target
+DST_URL='https://secops-new.internal:9200'
+DST_NETRC="$HOME/.netrc.secops-new"
+DST_CA='/etc/wazuh-indexer/certs/root-ca.pem'
+
+DST_VERSION_EXPECTED='2.19.5'
+
+# ------------------------------------------------------------------- notes
+#
+# Backfill engine: remote reindex is viable here (ES 7 source).
+#   Prerequisite: reindex.remote.whitelist must include the source host:port
+#   in /etc/wazuh-indexer/opensearch.yml on EVERY indexer node. It is a static
+#   setting — rolling restart required. Schedule before backfill day.
+#
+# Cutover mechanism: Logstash output change.
+#   The existing Logstash is load-bearing, not vestigial. It performs apiKey
+#   redaction, data.trace type coercion, and fan-out to GCS cold storage.
+#   Going native Filebeat would silently drop all three.
+#
+#   When rewriting that output: set manage_template => false. The 4.5.4-era
+#   wazuh-template.json with template_overwrite => true would replace the
+#   4.14.7 template the Wazuh install ships, discarding nine minor versions of
+#   field definitions at the first connection.
+#
+# Known non-migratable: vulnerability history.
+#   Wazuh 4.8 moved vulnerability state into wazuh-states-vulnerabilities-*.
+#   On 4.5.4 that data lived in agent-local SQLite, so there is nothing on the
+#   source to copy. It repopulates as agents rescan.
+#
+# Pre-backfill gate: mapping type conflicts.
+#   Diff source and target wazuh-alerts mappings for fields present in both
+#   with different types. Those documents get rejected or silently coerced.
+#   See docs/RUNBOOK.md.

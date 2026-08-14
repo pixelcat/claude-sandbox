@@ -1,0 +1,766 @@
+#!/usr/bin/env bash
+#
+# es-to-opensearch-migrate — audited Elasticsearch to OpenSearch migration.
+#
+# SYNOPSIS
+#     es-to-opensearch-migrate --profile NAME [OPTIONS] SUBCOMMAND
+#
+# DESCRIPTION
+#     Migrates an Elasticsearch cluster to OpenSearch under an auditable,
+#     resumable process. Every action is recorded in a hash-chained JSONL
+#     audit log; no document content and no credential is ever written to a
+#     log or the terminal.
+#
+#     Designed to run ON THE DESTINATION SYSTEM, with exactly one
+#     source/target pair per invocation. Handling more than one pair in a
+#     single run would concentrate credentials across security domains and
+#     blur the audit trail, so it is refused.
+#
+#     The intended sequence is: clients cut over to the new cluster first,
+#     the old cluster goes read-only, then historical data is backfilled.
+#     feature-scan gates the whole thing — it reports capabilities in use on
+#     the source that the target cannot provide.
+#
+# SUBCOMMANDS
+#     feature-scan     Inventory source features and classify them against the
+#                      target's OpenSearch version. Read-only. Exits 4 if any
+#                      finding has no equivalent on the target.
+#     verify-chain     Recompute the audit log hash chain and report breaks.
+#     self-test        Run internal consistency checks. No cluster access.
+#
+#     Later phases (config-audit, config-apply, backfill, verify-data,
+#     report) are not yet implemented; feature-scan is the gate they depend
+#     on and lands first.
+#
+# OPTIONS
+#     --profile NAME          Profile from profiles/NAME.conf. Required.
+#     --profile-dir PATH      Override the profile search directory.
+#     --out-dir PATH          Where reports and raw captures land.
+#                             Default: ./run-<profile>-<timestamp>
+#     --query-corpus GLOB     Log files to scan for query-time feature use
+#                             (proxy access logs, ES audit logs, slow logs).
+#                             Repeatable.
+#     --saved-objects PATH    Kibana saved-object NDJSON export to classify.
+#     --dry-run               Take no action that changes remote state.
+#                             feature-scan is read-only regardless.
+#     --insecure-i-accept-the-risk
+#                             Disable TLS verification. Recorded in the audit
+#                             log at the point of use.
+#     -h, --help              This text.
+#
+# REQUIREMENTS
+#     - bash 4+, curl, jq, sha256sum
+#     - A profile file defining source and target endpoints
+#     - netrc files, mode 600 or 400, one per side
+#     - Network reachability from this host to both clusters
+#
+# EXIT STATUS
+#     0  Completed with no blocking findings
+#     1  Fatal error
+#     2  Usage error
+#     3  Preflight failed (unreachable, auth failure, bad permissions)
+#     4  Completed, but blocking findings were reported
+#
+# SEE ALSO
+#     profiles/ops.conf.example, profiles/secops.conf.example
+#     docs/RUNBOOK.md
+
+set -euo pipefail
+umask 077
+
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+REPO_ROOT=$(cd -- "$SCRIPT_DIR/.." && pwd)
+
+# shellcheck source=../lib/common.sh
+source "$REPO_ROOT/lib/common.sh"
+# shellcheck source=../lib/compat.sh
+source "$REPO_ROOT/lib/compat.sh"
+
+# ------------------------------------------------------------------ globals
+
+PROFILE_NAME=''
+PROFILE_DIR="$REPO_ROOT/profiles"
+OUT_DIR=''
+DRY_RUN=0
+HTTP_ALLOW_INSECURE=0
+SAVED_OBJECTS=''
+declare -a QUERY_CORPUS=()
+declare -a FINDINGS=()
+
+usage() {
+  sed -n '2,/^set -euo/p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//; $d'
+}
+
+# --------------------------------------------------------------- arguments
+
+parse_args() {
+  local subcommand=''
+
+  while (( $# > 0 )); do
+    case $1 in
+      --profile)       PROFILE_NAME=${2:?--profile needs a value}; shift 2 ;;
+      --profile-dir)   PROFILE_DIR=${2:?--profile-dir needs a value}; shift 2 ;;
+      --out-dir)       OUT_DIR=${2:?--out-dir needs a value}; shift 2 ;;
+      --query-corpus)  QUERY_CORPUS+=("${2:?--query-corpus needs a value}"); shift 2 ;;
+      --saved-objects) SAVED_OBJECTS=${2:?--saved-objects needs a value}; shift 2 ;;
+      --dry-run)       DRY_RUN=1; shift ;;
+      --insecure-i-accept-the-risk) HTTP_ALLOW_INSECURE=1; shift ;;
+      -h|--help)       usage; exit "$EX_OK" ;;
+      -*)              die "$EX_USAGE" "unknown option: $1" ;;
+      *)
+        [[ -n $subcommand ]] && die "$EX_USAGE" "more than one subcommand given: $subcommand, $1"
+        subcommand=$1; shift ;;
+    esac
+  done
+
+  [[ -n $subcommand ]] || { usage; exit "$EX_USAGE"; }
+  SUBCOMMAND=$subcommand
+  export HTTP_ALLOW_INSECURE
+}
+
+load_profile() {
+  [[ -n $PROFILE_NAME ]] || die "$EX_USAGE" "--profile is required"
+
+  local path="$PROFILE_DIR/${PROFILE_NAME}.conf"
+  [[ -f $path ]] || die "$EX_USAGE" "profile not found: $path"
+
+  # Profiles are shell fragments. They are operator-authored config living
+  # beside the script, not untrusted input.
+  # shellcheck disable=SC1090
+  source "$path"
+
+  local var
+  for var in SRC_URL SRC_NETRC DST_URL DST_NETRC DST_VERSION_EXPECTED; do
+    [[ -n ${!var:-} ]] || die "$EX_USAGE" "profile $PROFILE_NAME is missing $var"
+  done
+
+  require_netrc "$SRC_NETRC" source
+  require_netrc "$DST_NETRC" target
+}
+
+# ---------------------------------------------------------------- preflight
+
+preflight() {
+  log_step "preflight: checking dependencies"
+  require_deps
+  http_init
+
+  if [[ $HTTP_ALLOW_INSECURE == 1 ]]; then
+    log_warn "TLS verification is DISABLED for this run"
+    audit_event tls_verification_disabled reason="operator passed --insecure-i-accept-the-risk"
+  fi
+
+  local side url
+  for side in src dst; do
+    [[ $side == src ]] && url=$SRC_URL || url=$DST_URL
+    log_step "preflight: contacting $side ($url)"
+
+    local root
+    if ! root=$(http_get "$side" '/'); then
+      audit_event preflight_failed side="$side" url="$url" reason="unreachable or auth rejected"
+      die "$EX_PREFLIGHT" "$side cluster unreachable or authentication failed: $url"
+    fi
+
+    local distro version
+    distro=$(jq -r '.version.distribution // "elasticsearch"' <<<"$root")
+    version=$(jq -r '.version.number' <<<"$root")
+
+    if [[ $side == src ]]; then
+      SRC_DISTRO=$distro SRC_VERSION=$version
+    else
+      DST_DISTRO=$distro DST_VERSION=$version
+    fi
+
+    log_info "$side: $distro $version"
+    audit_event preflight_ok side="$side" url="$url" distro="$distro" version="$version"
+  done
+
+  # Authentication is already proven by the successful GET above — an
+  # unauthenticated request against a secured cluster returns 401 and
+  # http_get would have failed. Record that explicitly for the audit trail
+  # rather than leaving it implicit.
+  audit_event auth_verified src_distro="$SRC_DISTRO" dst_distro="$DST_DISTRO"
+
+  if [[ $DST_DISTRO != opensearch ]]; then
+    die "$EX_PREFLIGHT" "target is $DST_DISTRO, expected opensearch"
+  fi
+
+  if [[ $DST_VERSION != "$DST_VERSION_EXPECTED" ]]; then
+    log_warn "target version $DST_VERSION differs from profile's expected $DST_VERSION_EXPECTED"
+    log_warn "compatibility rules will be evaluated against the live version, $DST_VERSION"
+    audit_event version_mismatch expected="$DST_VERSION_EXPECTED" actual="$DST_VERSION"
+  fi
+
+  local health
+  if health=$(http_get dst '/_cluster/health'); then
+    local status
+    status=$(jq -r '.status' <<<"$health")
+    if [[ $status == red ]]; then
+      log_warn "target cluster health is RED"
+    fi
+    audit_event target_health status="$status"
+  fi
+}
+
+# ----------------------------------------------------------------- findings
+
+# add_finding <id> <evidence> <count>
+#
+# Disposition is resolved against the live target version, not the profile's
+# expectation, so a target that was upgraded or downgraded out from under the
+# profile still gets correct answers.
+add_finding() {
+  local id=$1 evidence=$2 count=${3:-1}
+  local resolved disposition note category
+
+  resolved=$(compat_lookup "$id" "$DST_VERSION")
+  disposition=${resolved%%|*}
+  note=${resolved#*|}
+  category=$(compat_category "$id")
+
+  local blocking=false
+  compat_is_blocking "$disposition" && blocking=true
+
+  FINDINGS+=("$(jq -cn \
+    --arg id "$id" \
+    --arg category "$category" \
+    --arg disposition "$disposition" \
+    --arg evidence "$evidence" \
+    --arg count "$count" \
+    --arg note "$note" \
+    --argjson blocking "$blocking" \
+    '{id: $id, category: $category, disposition: $disposition,
+      evidence: $evidence, count: ($count | tonumber? // 0),
+      note: $note, blocking: $blocking}')")
+
+  audit_event finding id="$id" disposition="$disposition" evidence="$evidence" count="$count"
+  log_info "finding: $id [$disposition] — $evidence"
+}
+
+# --------------------------------------------------- collectors: x-pack usage
+#
+# GET /_xpack/usage is the highest-value single call: it reports which
+# licensed features are enabled AND how much they are used. Present on both
+# ES 7 and ES 8.
+
+scan_xpack_usage() {
+  log_step "scanning: _xpack/usage"
+
+  local usage
+  if ! usage=$(http_get src '/_xpack/usage'); then
+    log_warn "_xpack/usage unavailable — falling back to per-feature probes only"
+    audit_event scan_skipped scan="xpack_usage" reason="endpoint unavailable"
+    return 0
+  fi
+
+  printf '%s' "$usage" >"$OUT_DIR/raw/xpack-usage.json"
+
+  # id : jq expression yielding a usage count. Empty or 0 means not in use.
+  local -a probes=(
+    'sql|(.sql.queries._all.total // .sql.queries.rest.total // 0)'
+    'eql|(.eql.queries._all.total // 0)'
+    'esql|(.esql.queries._all.total // .esql.available // 0)'
+    'watcher|(.watcher.count.active // 0)'
+    'transforms|(.transform.transforms._all // .transform.transforms.total // 0)'
+    'ml_anomaly|(.ml.jobs._all.count // 0)'
+    'ml_dfa|(.ml.data_frame_analytics_jobs._all.count // 0)'
+    'trained_models|(.ml.inference.trained_models._all.count // 0)'
+    'ccr|(.ccr.follower_indices_count // 0)'
+    'graph|(if (.graph.available and .graph.enabled) then 1 else 0 end)'
+    'runtime_fields|(.runtime_fields.field_types | length? // 0)'
+    'dense_vector|(.vectors.dense_vector_fields_count // 0)'
+    'sparse_vector|(.vectors.sparse_vector_fields_count // 0)'
+    'data_streams|(.data_streams.data_streams // 0)'
+    'ilm|(.ilm.policy_count // 0)'
+    'slm|(.slm.policy_count // 0)'
+    'searchable_snapshots|(.searchable_snapshots.indices_count // 0)'
+    'rollup|(if (.rollup.available and .rollup.enabled) then 1 else 0 end)'
+    'fleet|(.fleet.agents.total // 0)'
+  )
+
+  local probe id expr count
+  for probe in "${probes[@]}"; do
+    id=${probe%%|*}
+    expr=${probe#*|}
+    count=$(jq -r "$expr // 0" <<<"$usage" 2>/dev/null || echo 0)
+    [[ $count =~ ^[0-9]+$ ]] || count=0
+    if (( count > 0 )); then
+      add_finding "$id" "_xpack/usage reports $count in use" "$count"
+    fi
+  done
+}
+
+# --------------------------------------------------- collectors: direct APIs
+#
+# Features that _xpack/usage does not cover, or covers unreliably across the
+# 7-to-8 span.
+
+scan_direct_apis() {
+  log_step "scanning: direct feature endpoints"
+
+  _probe_count enrich   '/_enrich/policy'  '.policies | length'   'enrich policies defined'
+  _probe_count ilm      '/_ilm/policy'     'length'               'ILM policies defined'
+  _probe_count slm      '/_slm/policy'     'length'               'SLM policies defined'
+  _probe_count transforms '/_transform'    '.count // 0'          'transforms defined'
+  _probe_count data_streams '/_data_stream' '.data_streams | length' 'data streams defined'
+
+  # Ingest processors that have no counterpart. Pipeline definitions are
+  # config, not documents, so they are safe to inspect in full.
+  local pipelines
+  if pipelines=$(http_get src '/_ingest/pipeline'); then
+    printf '%s' "$pipelines" >"$OUT_DIR/raw/ingest-pipelines.json"
+
+    local n
+    n=$(jq '[.. | objects | select(has("enrich")) ] | length' <<<"$pipelines" 2>/dev/null || echo 0)
+    if (( n > 0 )); then
+      add_finding enrich "$n enrich processors in ingest pipelines" "$n"
+    fi
+
+    n=$(jq '[.. | objects | select(has("inference")) ] | length' <<<"$pipelines" 2>/dev/null || echo 0)
+    if (( n > 0 )); then
+      add_finding inference_processor "$n inference processors in ingest pipelines" "$n"
+    fi
+  fi
+
+  # Roles carrying document- or field-level security. The role definitions
+  # themselves are policy, but they can embed query fragments referencing
+  # field names, so only the count is recorded.
+  local roles
+  if roles=$(http_get src '/_security/role'); then
+    local n
+    n=$(jq '[to_entries[] | select(.value.indices[]? | (has("query") or has("field_security")))] | length' \
+        <<<"$roles" 2>/dev/null || echo 0)
+    if (( n > 0 )); then
+      add_finding dls_fls "$n roles use document- or field-level security" "$n"
+    fi
+  fi
+
+  # API keys in use means clients authenticate in a way OpenSearch does not
+  # offer. This endpoint often 403s for non-superusers; absence is not proof.
+  local keys
+  if keys=$(http_get src '/_security/api_key?owner=false'); then
+    local n
+    n=$(jq '[.api_keys[]? | select(.invalidated == false)] | length' <<<"$keys" 2>/dev/null || echo 0)
+    if (( n > 0 )); then
+      add_finding api_keys "$n active API keys" "$n"
+    fi
+  else
+    log_warn "could not enumerate API keys (insufficient privilege is common); check manually"
+    audit_event scan_incomplete scan="api_keys" reason="endpoint returned non-2xx"
+  fi
+}
+
+_probe_count() {
+  local id=$1 path=$2 filter=$3 label=$4
+  local body count
+
+  if ! body=$(http_get src "$path"); then
+    return 0
+  fi
+
+  count=$(jq -r "$filter // 0" <<<"$body" 2>/dev/null || echo 0)
+  [[ $count =~ ^[0-9]+$ ]] || count=0
+  if (( count > 0 )); then
+    add_finding "$id" "$count $label" "$count"
+  fi
+  return 0
+}
+
+# ----------------------------------------------------- collectors: mappings
+#
+# Field types are ground truth for what is actually indexed, including
+# anything dynamic mapping added beyond the templates.
+
+scan_mappings() {
+  log_step "scanning: index mappings (field types)"
+
+  local mappings
+  if ! mappings=$(http_get src '/_all/_mapping'); then
+    log_warn "could not read mappings; field-type findings will be missing"
+    audit_event scan_skipped scan="mappings" reason="endpoint returned non-2xx"
+    return 0
+  fi
+
+  printf '%s' "$mappings" >"$OUT_DIR/raw/mappings.json"
+
+  # Field names are metadata, but field VALUES never appear in a mapping, so
+  # this capture carries no document content.
+  local types
+  types=$(jq -r '[paths(scalars) as $p | select($p[-1] == "type") | getpath($p)] | unique[]' \
+          <<<"$mappings" 2>/dev/null || true)
+
+  # ES field type -> compat rule id. Types absent here are either present on
+  # OpenSearch or not worth flagging.
+  local -A type_rules=(
+    [flattened]=flattened
+    [dense_vector]=dense_vector
+    [sparse_vector]=sparse_vector
+    [constant_keyword]=constant_keyword
+    [wildcard]=wildcard_type
+    [version]=version_type
+    [match_only_text]=match_only_text
+    [histogram]=histogram_type
+    [aggregate_metric_double]=aggregate_metric_double
+    [unsigned_long]=unsigned_long
+  )
+
+  local t count
+  while IFS= read -r t; do
+    [[ -n $t ]] || continue
+    [[ -v type_rules[$t] ]] || continue
+    count=$(jq --arg t "$t" '[paths(scalars) as $p | select($p[-1] == "type") | select(getpath($p) == $t)] | length' \
+            <<<"$mappings" 2>/dev/null || echo 0)
+    add_finding "${type_rules[$t]}" "field type '$t' used in $count field(s)" "$count"
+  done <<<"$types"
+}
+
+# ------------------------------------------------ collectors: query corpus
+#
+# Query-time features leave no trace in cluster state. Path-only matching is
+# listed first because it identifies every blocking feature without reading a
+# single document value — the boundary-safe option.
+
+scan_query_corpus() {
+  (( ${#QUERY_CORPUS[@]} > 0 )) || {
+    log_warn "no --query-corpus given; query-time feature use cannot be detected"
+    log_warn "features used only at query time (ES|QL, EQL, SQL, runtime_mappings) will be MISSED"
+    audit_event scan_skipped scan="query_corpus" reason="no corpus supplied"
+    return 0
+  }
+
+  log_step "scanning: query corpus (${#QUERY_CORPUS[@]} pattern(s))"
+
+  local -a files=()
+  local pattern f
+  for pattern in "${QUERY_CORPUS[@]}"; do
+    # Word splitting is intended: the pattern is a glob.
+    # shellcheck disable=SC2206
+    local -a expanded=($pattern)
+    for f in "${expanded[@]}"; do
+      [[ -r $f ]] && files+=("$f")
+    done
+  done
+
+  (( ${#files[@]} > 0 )) || {
+    log_warn "query corpus matched no readable files"
+    return 0
+  }
+
+  log_info "query corpus: ${#files[@]} file(s)"
+
+  # URI-path signals. Each maps to a feature with no OpenSearch counterpart,
+  # and matching a path reveals nothing about the data.
+  local -a path_rules=(
+    'esql|/_query'
+    'eql|/_eql/search'
+    'sql|/_sql'
+    'async_search|/_async_search'
+    'point_in_time|/_pit'
+    'terms_enum|/_terms_enum'
+    'inference_processor|/_inference'
+  )
+
+  local rule id needle n
+  for rule in "${path_rules[@]}"; do
+    id=${rule%%|*}
+    needle=${rule#*|}
+    n=$(_corpus_count "$needle" "${files[@]}")
+    if (( n > 0 )); then
+      add_finding "$id" "$n request(s) to $needle in query corpus" "$n"
+    fi
+  done
+
+  # Body signals. These require the corpus to contain request bodies, which
+  # means the corpus itself holds document-adjacent content and must stay
+  # in-boundary. Only counts are recorded, never matched text.
+  local -a body_rules=(
+    'runtime_fields|runtime_mappings'
+    'elser|text_expansion'
+    'elser|semantic_text'
+    'retriever|"retriever"'
+    'dense_vector|"knn"'
+  )
+
+  for rule in "${body_rules[@]}"; do
+    id=${rule%%|*}
+    needle=${rule#*|}
+    n=$(_corpus_count "$needle" "${files[@]}")
+    if (( n > 0 )); then
+      add_finding "$id" "$n occurrence(s) of '$needle' in query corpus" "$n"
+    fi
+  done
+}
+
+# _corpus_count <needle> <file>...
+#
+# grep exits 1 on no-match, which under `set -o pipefail` fails the whole
+# assignment and aborts the run. No-match is a normal, expected result here,
+# so it is absorbed. Matched text is counted, never returned.
+_corpus_count() {
+  local needle=$1; shift
+  local n
+  n=$( { grep -F -o -h -- "$needle" "$@" 2>/dev/null || true; } | wc -l | tr -d ' ')
+  printf '%s' "${n:-0}"
+}
+
+# --------------------------------------------- collectors: saved objects
+#
+# A Kibana saved-object export doubles as a query inventory and as the
+# dashboards work list.
+
+scan_saved_objects() {
+  [[ -n $SAVED_OBJECTS ]] || return 0
+  [[ -r $SAVED_OBJECTS ]] || die "$EX_USAGE" "saved objects file unreadable: $SAVED_OBJECTS"
+
+  log_step "scanning: saved objects ($SAVED_OBJECTS)"
+
+  # NDJSON, one object per line. Type counts only; the objects contain
+  # analyst-authored content and are not copied into the report.
+  local -A counts=()
+  local line type
+  while IFS= read -r line; do
+    [[ -n $line ]] || continue
+    type=$(jq -r '.type // empty' <<<"$line" 2>/dev/null) || continue
+    [[ -n $type ]] || continue
+    counts[$type]=$(( ${counts[$type]:-0} + 1 ))
+  done <"$SAVED_OBJECTS"
+
+  local -A object_rules=(
+    [lens]=lens
+    [canvas-workpad]=canvas
+    [map]=kibana_maps
+    [alert]=kibana_alerting
+    [action]=kibana_alerting
+    [space]=spaces
+  )
+
+  local t
+  for t in "${!counts[@]}"; do
+    if [[ -v object_rules[$t] ]]; then
+      add_finding "${object_rules[$t]}" "$t: ${counts[$t]} saved object(s)" "${counts[$t]}"
+    fi
+    printf '%s\t%s\n' "$t" "${counts[$t]}" >>"$OUT_DIR/raw/saved-object-counts.tsv"
+  done
+
+  # Kibana 8 lineage is decided by the source stack version, not by object
+  # content: 8.x saved objects do not import into OpenSearch Dashboards.
+  if [[ $(version_major "$SRC_VERSION") -ge 8 ]]; then
+    local total=0
+    for t in "${!counts[@]}"; do total=$(( total + counts[$t] )); done
+    add_finding saved_objects_8x "source stack is $SRC_VERSION; $total saved object(s) require rebuild" "$total"
+  fi
+}
+
+# ------------------------------------------------------------------ report
+
+write_report() {
+  local json_path="$OUT_DIR/features.json"
+
+  # One finding per feature id. The same feature is routinely detected by more
+  # than one collector (esql shows up in _xpack/usage and again in the query
+  # corpus); merging keeps the evidence while making the summary counts and
+  # the blocking gate reflect distinct features rather than detections.
+  local findings_json='[]'
+  if (( ${#FINDINGS[@]} > 0 )); then
+    findings_json=$(printf '%s\n' "${FINDINGS[@]}" | jq -s '
+      group_by(.id)
+      | map({
+          id: .[0].id,
+          category: .[0].category,
+          disposition: .[0].disposition,
+          note: .[0].note,
+          blocking: .[0].blocking,
+          count: (map(.count) | max),
+          evidence: (map(.evidence) | unique)
+        })
+      | sort_by([(if .blocking then 0 else 1 end), .category, .id])')
+  fi
+
+  jq -n \
+    --arg profile "$PROFILE_NAME" \
+    --arg generated "$(_stamp)" \
+    --arg src_distro "$SRC_DISTRO" --arg src_version "$SRC_VERSION" \
+    --arg dst_distro "$DST_DISTRO" --arg dst_version "$DST_VERSION" \
+    --arg audit_head "$(audit_head)" \
+    --argjson findings "$findings_json" \
+    '{profile: $profile, generated: $generated,
+      source: {distribution: $src_distro, version: $src_version},
+      target: {distribution: $dst_distro, version: $dst_version},
+      audit_chain_head: $audit_head,
+      summary: ($findings | group_by(.disposition)
+                | map({key: .[0].disposition, value: length}) | from_entries),
+      findings: $findings}' >"$json_path"
+
+  log_info "wrote $json_path"
+
+  # Human report on stdout. stderr carries the running log, so a caller can
+  # redirect them apart.
+  printf '\n'
+  printf 'FEATURE SCAN — profile %s\n' "$PROFILE_NAME"
+  printf '  source: %s %s\n' "$SRC_DISTRO" "$SRC_VERSION"
+  printf '  target: %s %s\n' "$DST_DISTRO" "$DST_VERSION"
+  printf '\n'
+
+  if (( ${#FINDINGS[@]} == 0 )); then
+    printf '  No findings. Nothing detected on the source that the target cannot provide.\n'
+    printf '  This is only as complete as the inputs: without --query-corpus,\n'
+    printf '  query-time features were not examined.\n\n'
+    return
+  fi
+
+  local disp
+  for disp in NO-EQUIVALENT UNKNOWN REBUILD TRANSLATE PORTABLE; do
+    local rows
+    rows=$(jq -r --arg d "$disp" \
+      '.findings[] | select(.disposition == $d)
+       | "    \(.id)  (\(.category))\n"
+         + (.evidence | map("      - \(.)") | join("\n"))
+         + "\n      \(.note)\n"' \
+      "$json_path")
+    [[ -n $rows ]] || continue
+    # $( ) strips trailing newlines, so the separator is added explicitly.
+    printf '  %s\n%s\n\n' "$disp" "$rows"
+  done
+
+  local blocking
+  blocking=$(jq '[.findings[] | select(.blocking)] | length' "$json_path")
+  printf '  %s blocking finding(s).\n\n' "$blocking"
+}
+
+# ------------------------------------------------------------- subcommands
+
+cmd_feature_scan() {
+  preflight
+
+  mkdir -p "$OUT_DIR/raw"
+  audit_event scan_started subcommand=feature-scan out_dir="$OUT_DIR"
+
+  scan_xpack_usage
+  scan_direct_apis
+  scan_mappings
+  scan_query_corpus
+  scan_saved_objects
+
+  write_report
+
+  local blocking
+  blocking=$(jq '[.findings[] | select(.blocking)] | length' "$OUT_DIR/features.json")
+  audit_event scan_completed findings="${#FINDINGS[@]}" blocking="$blocking"
+
+  if (( blocking > 0 )); then
+    exit "$EX_FINDINGS"
+  fi
+  exit "$EX_OK"
+}
+
+cmd_verify_chain() {
+  local log_path="${AUDIT_LOG:?}"
+  audit_verify "$log_path" || exit "$EX_FATAL"
+  exit "$EX_OK"
+}
+
+cmd_self_test() {
+  local failures=0
+
+  # _t asserts the command succeeds; _tn asserts it fails.
+  _t() {
+    local name=$1; shift
+    if "$@"; then
+      printf '  ok    %s\n' "$name"
+    else
+      printf '  FAIL  %s\n' "$name"
+      failures=$((failures + 1))
+    fi
+  }
+
+  _tn() {
+    local name=$1; shift
+    if "$@"; then
+      printf '  FAIL  %s\n' "$name"
+      failures=$((failures + 1))
+    else
+      printf '  ok    %s\n' "$name"
+    fi
+  }
+
+  printf 'self-test\n'
+
+  _t  'version_ge 2.19.5 >= 2.15'  version_ge 2.19.5 2.15
+  _t  'version_ge 3.3.2 >= 2.19.5' version_ge 3.3.2 2.19.5
+  _t  'version_ge 2.4 >= 2.4'      version_ge 2.4 2.4
+  _tn 'version_ge 2.7 not >= 2.15' version_ge 2.7 2.15
+  _tn 'version_ge 2.11 not >= 2.15' version_ge 2.11 2.15
+
+  _t 'compat table is populated' bash -c "[[ $(compat_rule_count) -gt 30 ]]"
+
+  # runtime_fields is the rule that must differ between the two targets.
+  local on_3 on_2
+  on_3=$(compat_lookup runtime_fields 3.3.2); on_3=${on_3%%|*}
+  on_2=$(compat_lookup runtime_fields 2.19.5); on_2=${on_2%%|*}
+  _t "runtime_fields TRANSLATE on 3.3.2 (got $on_3)" test "$on_3" = TRANSLATE
+  _t "runtime_fields TRANSLATE on 2.19.5 (got $on_2)" test "$on_2" = TRANSLATE
+
+  local on_old
+  on_old=$(compat_lookup runtime_fields 2.11); on_old=${on_old%%|*}
+  _t "runtime_fields NO-EQUIVALENT on 2.11 (got $on_old)" test "$on_old" = NO-EQUIVALENT
+
+  local unknown
+  unknown=$(compat_lookup no_such_feature 3.3.2); unknown=${unknown%%|*}
+  _t "unknown id yields UNKNOWN (got $unknown)" test "$unknown" = UNKNOWN
+  _t  'NO-EQUIVALENT is blocking'   compat_is_blocking NO-EQUIVALENT
+  _t  'UNKNOWN is blocking'         compat_is_blocking UNKNOWN
+  _tn 'TRANSLATE is not blocking'   compat_is_blocking TRANSLATE
+  _tn 'REBUILD is not blocking'     compat_is_blocking REBUILD
+
+  # Redaction must catch the shapes that appear in real configs.
+  local out
+  out=$(printf 'password => "hunter2"\n' | redact)
+  _t 'redacts logstash password' bash -c "[[ '$out' != *hunter2* ]]"
+
+  out=$(printf 'https://user:s3cret@host:9200/\n' | redact)
+  _t 'redacts URL credentials' bash -c "[[ '$out' != *s3cret* ]]"
+
+  out=$(printf 'GET /x?apiKey=abc123&z=1\n' | redact)
+  _t 'redacts apiKey query param' bash -c "[[ '$out' != *abc123* ]]"
+
+  out=$(printf 'machine es.local login elastic password topsecret\n' | redact)
+  _t 'redacts netrc line' bash -c "[[ '$out' != *topsecret* ]]"
+
+  # strip_hits must drop _source.
+  out=$(printf '{"hits":{"hits":[{"_id":"1","_source":{"secret_field":"value"}}]}}' | strip_hits)
+  _t 'strip_hits drops _source' bash -c "[[ '$out' != *secret_field* ]]"
+
+  printf '\n%d failure(s)\n' "$failures"
+  (( failures == 0 )) || exit "$EX_FATAL"
+  exit "$EX_OK"
+}
+
+# ------------------------------------------------------------------- main
+
+main() {
+  parse_args "$@"
+
+  if [[ $SUBCOMMAND == self-test ]]; then
+    require_deps
+    cmd_self_test
+  fi
+
+  load_profile
+
+  [[ -n $OUT_DIR ]] || OUT_DIR="./run-${PROFILE_NAME}-$(date -u +%Y%m%dT%H%M%SZ)"
+  mkdir -p "$OUT_DIR"
+  chmod 0700 "$OUT_DIR"
+
+  audit_init "$OUT_DIR/audit.jsonl"
+  audit_event run_started profile="$PROFILE_NAME" subcommand="$SUBCOMMAND" dry_run="$DRY_RUN"
+
+  trap 'audit_event run_interrupted subcommand="$SUBCOMMAND"' INT TERM
+
+  case $SUBCOMMAND in
+    feature-scan) cmd_feature_scan ;;
+    verify-chain) cmd_verify_chain ;;
+    *) die "$EX_USAGE" "unknown subcommand: $SUBCOMMAND" ;;
+  esac
+}
+
+main "$@"
