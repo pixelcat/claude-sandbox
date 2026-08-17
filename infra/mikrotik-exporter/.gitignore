@@ -1,0 +1,7 @@
+# Never commit real secrets. Only *.example.yaml templates belong in git.
+*.secret.yaml
+!*.secret.example.yaml
+mktxp.conf
+api.crt
+api.key
+*.pem

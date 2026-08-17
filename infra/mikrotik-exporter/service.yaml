@@ -1,0 +1,17 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: mktxp
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/name: mktxp
+    app.kubernetes.io/component: exporter
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: mktxp
+  ports:
+    - name: metrics
+      port: 49090
+      targetPort: metrics
+      protocol: TCP

@@ -1,0 +1,13 @@
+# The exporter lives in the same namespace as kube-prometheus-stack so that
+# the Prometheus Operator's ServiceMonitor discovery and the Grafana sidecar
+# both find their objects without extra namespace-selector wiring.
+#
+# If your kube-prometheus-stack release is NOT in `monitoring`, change the
+# namespace here and in every other file (or run through kustomize with a
+# namespace override) to match.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: monitoring
+  labels:
+    kubernetes.io/metadata.name: monitoring

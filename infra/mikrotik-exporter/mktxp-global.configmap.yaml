@@ -1,0 +1,35 @@
+# Global, non-secret mktxp settings (_mktxp.conf).
+# Router connection entries live in the Secret (they contain passwords) —
+# see mktxp-routers.secret.example.yaml. Both files are projected together
+# into /etc/mktxp inside the pod.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mktxp-global
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/name: mktxp
+    app.kubernetes.io/component: exporter
+data:
+  _mktxp.conf: |
+    [MKTXP]
+        listen = '0.0.0.0:49090'
+        # socket_timeout bounds how long a single router API call may hang.
+        socket_timeout = 5
+        # Back off scraping a router that is failing so we don't hammer it
+        # (mitigates the scrape-time DoS-amplification path against routers).
+        initial_delay_on_failure = 120
+        max_delay_on_failure = 900
+        delay_inc_div = 5
+        # Bandwidth test is intrusive (generates traffic) — keep it OFF.
+        bandwidth = False
+        bandwidth_test_interval = 600
+        verbose_mode = False
+        minimal_collect_interval = 5
+        # Scrape the 3 routers concurrently; bound the worker pool and the
+        # total scrape time so a slow router can't stall the whole endpoint.
+        fetch_routers_in_parallel = True
+        max_worker_threads = 3
+        max_scrape_duration = 30
+        total_max_scrape_duration = 90
+        compact_default_conf_values = True

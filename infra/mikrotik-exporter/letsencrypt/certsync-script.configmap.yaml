@@ -1,0 +1,112 @@
+# Reference cert-sync script. REVIEW AND TEST against LE staging + a single
+# router before trusting in production — RouterOS cert import/naming behaviour
+# varies by version, and this pushes a cert + flips /ip service on live gear.
+#
+# What it does, per router:
+#   1. SFTP-upload the LE cert (tls.crt) and key (tls.key).
+#   2. Remove any previously synced cert (name prefix "mktxp-api").
+#   3. Import cert + key.
+#   4. Point /ip service api-ssl at the freshly imported cert.
+#   5. Delete the uploaded key/cert files from the router's filesystem.
+# It is idempotent: re-running only makes changes when the cert fingerprint
+# on the router differs from the one in the Secret.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mktxp-certsync-script
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/part-of: mikrotik-monitoring
+data:
+  sync.py: |
+    #!/usr/bin/env python3
+    """Push the cert-manager-issued LE cert onto each RouterOS device."""
+    import hashlib
+    import os
+    import sys
+    import time
+
+    import paramiko  # provided by the python:3-slim + pip install at runtime
+
+    CERT_PATH = "/tls/tls.crt"
+    KEY_PATH = "/tls/tls.key"
+    CERT_NAME = "mktxp-api"            # RouterOS cert name prefix we own
+    REMOTE_CRT = "mktxp-api.crt"
+    REMOTE_KEY = "mktxp-api.key"
+
+    ROUTERS = [h.strip() for h in os.environ["ROUTER_HOSTS"].split(",") if h.strip()]
+    USER = os.environ["ROUTER_USER"]
+    PASSWORD = os.environ.get("ROUTER_PASSWORD") or None
+    KEY_FILE = os.environ.get("ROUTER_SSH_KEY") or None
+    PORT = int(os.environ.get("ROUTER_SSH_PORT", "22"))
+
+    def fingerprint(path):
+        with open(path, "rb") as fh:
+            return hashlib.sha256(fh.read()).hexdigest()[:16]
+
+    def ssh_connect(host):
+        client = paramiko.SSHClient()
+        # RouterOS host keys are not in a known_hosts store here. If you can
+        # pre-seed known_hosts, switch to RejectPolicy for stronger security.
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        kwargs = {"username": USER, "port": PORT, "timeout": 15,
+                  "allow_agent": False, "look_for_keys": False}
+        if KEY_FILE:
+            kwargs["key_filename"] = KEY_FILE
+        else:
+            kwargs["password"] = PASSWORD
+        client.connect(host, **kwargs)
+        return client
+
+    def run(client, cmd):
+        stdin, stdout, stderr = client.exec_command(cmd)
+        out = stdout.read().decode().strip()
+        err = stderr.read().decode().strip()
+        code = stdout.channel.recv_exit_status()
+        if code != 0 or "failure" in (out + err).lower():
+            raise RuntimeError(f"cmd failed ({code}): {cmd}\n{out}\n{err}")
+        return out
+
+    def sync_router(host, fp):
+        print(f"[{host}] connecting", flush=True)
+        client = ssh_connect(host)
+        try:
+            # Skip if the router already serves a cert with this fingerprint.
+            existing = run(client, f':put [/certificate get [find name~"{CERT_NAME}"] fingerprint]') \
+                if run(client, f':put [:len [/certificate find name~"{CERT_NAME}"]]') != "0" else ""
+            if existing and existing.startswith(fp[:8]):
+                print(f"[{host}] cert up to date, skipping", flush=True)
+                return
+            sftp = client.open_sftp()
+            sftp.put(CERT_PATH, REMOTE_CRT)
+            sftp.put(KEY_PATH, REMOTE_KEY)
+            sftp.close()
+            # Remove prior cert(s) we own, then import fresh.
+            run(client, f'/certificate remove [find name~"{CERT_NAME}"]')
+            run(client, f'/certificate import file-name={REMOTE_CRT} passphrase=""')
+            run(client, f'/certificate import file-name={REMOTE_KEY} passphrase=""')
+            imported = run(client, f':put [/certificate find name~"{REMOTE_CRT}"]').split()[0]
+            run(client, f'/ip service set api-ssl certificate={imported} disabled=no')
+            # Scrub the uploaded key material from the router filesystem.
+            run(client, f'/file remove [find name={REMOTE_CRT}]')
+            run(client, f'/file remove [find name={REMOTE_KEY}]')
+            print(f"[{host}] installed cert {imported}", flush=True)
+        finally:
+            client.close()
+
+    def main():
+        fp = fingerprint(CERT_PATH)
+        failures = []
+        for host in ROUTERS:
+            try:
+                sync_router(host, fp)
+            except Exception as exc:  # keep going; report at the end
+                print(f"[{host}] ERROR: {exc}", file=sys.stderr, flush=True)
+                failures.append(host)
+        if failures:
+            print(f"FAILED: {', '.join(failures)}", file=sys.stderr)
+            sys.exit(1)
+        print("all routers synced")
+
+    if __name__ == "__main__":
+        main()

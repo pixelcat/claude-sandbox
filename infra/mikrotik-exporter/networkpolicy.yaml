@@ -1,0 +1,72 @@
+# Two policies:
+#  1. Lock the exporter's /metrics ingress to Prometheus only. Without this,
+#     default allow-all networking lets ANY pod scrape it — an info-disclosure
+#     AND a DoS-amplification path (every scrape hits the live routers).
+#  2. Lock the exporter's egress to the router management network (api-ssl)
+#     plus DNS. It should never talk to anything else.
+#
+# Requires a NetworkPolicy-enforcing CNI (Cilium, Calico, etc.). On a CNI
+# that ignores NetworkPolicy these are silently inert — confirm enforcement.
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: mktxp-ingress
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/name: mktxp
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: mktxp
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        # Prometheus pods in the monitoring namespace. Adjust the pod label
+        # to match your kube-prometheus-stack Prometheus pods
+        # (`kubectl -n monitoring get pod --show-labels | grep prometheus`).
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: prometheus
+      ports:
+        - port: metrics
+          protocol: TCP
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: mktxp-egress
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/name: mktxp
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: mktxp
+  policyTypes:
+    - Egress
+  egress:
+    # RouterOS api-ssl on the router management network only.
+    # REPLACE 10.0.0.0/24 with the CIDR that covers the resolved IPs of
+    # doohickey/gizmo/gadget.internal.dployr.com. NetworkPolicy cannot match
+    # DNS names, so this must be an address range.
+    - to:
+        - ipBlock:
+            cidr: 10.0.0.0/24   # <-- REPLACE with router mgmt CIDR
+      ports:
+        - port: 8729
+          protocol: TCP
+    # DNS resolution for the router FQDNs.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP

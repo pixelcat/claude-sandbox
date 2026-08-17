@@ -1,0 +1,114 @@
+# Grafana dashboard for mktxp, auto-loaded by the kube-prometheus-stack
+# Grafana sidecar (it watches ConfigMaps labelled grafana_dashboard="1").
+#
+# This is a compact starter using metric names verified against mktxp's
+# source. For the full official dashboard, import Grafana.com ID 13679
+# (Dashboards -> Import -> 13679) and pick your Prometheus datasource.
+#
+# If your Grafana sidecar only watches its own namespace, this ConfigMap is
+# already in `monitoring`. If it watches a specific folder, set the
+# `grafana_folder` annotation below.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mktxp-grafana-dashboard
+  namespace: monitoring
+  labels:
+    grafana_dashboard: "1"
+    app.kubernetes.io/part-of: mikrotik-monitoring
+  annotations:
+    grafana_folder: "Network"
+data:
+  mikrotik-mktxp.json: |
+    {
+      "title": "MikroTik — mktxp",
+      "uid": "mikrotik-mktxp",
+      "editable": true,
+      "schemaVersion": 39,
+      "timezone": "browser",
+      "time": { "from": "now-6h", "to": "now" },
+      "refresh": "1m",
+      "tags": ["mikrotik", "mktxp", "network"],
+      "templating": {
+        "list": [
+          {
+            "type": "datasource",
+            "name": "datasource",
+            "label": "Datasource",
+            "query": "prometheus",
+            "current": {},
+            "hide": 0
+          },
+          {
+            "type": "query",
+            "name": "router",
+            "label": "Router",
+            "datasource": { "type": "prometheus", "uid": "${datasource}" },
+            "query": "label_values(mktxp_system_uptime, routerboard_name)",
+            "refresh": 2,
+            "includeAll": true,
+            "multi": true,
+            "current": { "text": "All", "value": "$__all" }
+          }
+        ]
+      },
+      "panels": [
+        {
+          "type": "stat", "title": "Routers reporting",
+          "gridPos": { "h": 4, "w": 6, "x": 0, "y": 0 },
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "fieldConfig": { "defaults": { "color": { "mode": "thresholds" }, "thresholds": { "steps": [ { "color": "red", "value": null }, { "color": "green", "value": 1 } ] } } },
+          "targets": [ { "refId": "A", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "expr": "count(count by (routerboard_name) (mktxp_system_uptime{routerboard_name=~\"$router\"}))" } ]
+        },
+        {
+          "type": "stat", "title": "Uptime",
+          "gridPos": { "h": 4, "w": 9, "x": 6, "y": 0 },
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "fieldConfig": { "defaults": { "unit": "s", "color": { "mode": "fixed", "fixedColor": "green" } } },
+          "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "textMode": "value_and_name" },
+          "targets": [ { "refId": "A", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "expr": "mktxp_system_uptime{routerboard_name=~\"$router\"}", "legendFormat": "{{routerboard_name}}" } ]
+        },
+        {
+          "type": "stat", "title": "Active DHCP leases",
+          "gridPos": { "h": 4, "w": 9, "x": 15, "y": 0 },
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "textMode": "value_and_name" },
+          "targets": [ { "refId": "A", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "expr": "sum by (routerboard_name) (mktxp_dhcp_lease_active_count{routerboard_name=~\"$router\"})", "legendFormat": "{{routerboard_name}}" } ]
+        },
+        {
+          "type": "timeseries", "title": "CPU load",
+          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 4 },
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "fieldConfig": { "defaults": { "unit": "percent", "min": 0, "max": 100 } },
+          "targets": [ { "refId": "A", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "expr": "mktxp_system_cpu_load{routerboard_name=~\"$router\"}", "legendFormat": "{{routerboard_name}}" } ]
+        },
+        {
+          "type": "timeseries", "title": "Memory used",
+          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 4 },
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "fieldConfig": { "defaults": { "unit": "percent", "min": 0, "max": 100 } },
+          "targets": [ { "refId": "A", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "expr": "(1 - mktxp_system_free_memory{routerboard_name=~\"$router\"} / mktxp_system_total_memory{routerboard_name=~\"$router\"}) * 100", "legendFormat": "{{routerboard_name}}" } ]
+        },
+        {
+          "type": "timeseries", "title": "Interface throughput — RX",
+          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 12 },
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "fieldConfig": { "defaults": { "unit": "bps", "min": 0 } },
+          "targets": [ { "refId": "A", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "expr": "rate(mktxp_interface_rx_byte{routerboard_name=~\"$router\"}[$__rate_interval]) * 8", "legendFormat": "{{routerboard_name}} / {{name}}" } ]
+        },
+        {
+          "type": "timeseries", "title": "Interface throughput — TX",
+          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 12 },
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "fieldConfig": { "defaults": { "unit": "bps", "min": 0 } },
+          "targets": [ { "refId": "A", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "expr": "rate(mktxp_interface_tx_byte{routerboard_name=~\"$router\"}[$__rate_interval]) * 8", "legendFormat": "{{routerboard_name}} / {{name}}" } ]
+        },
+        {
+          "type": "timeseries", "title": "CPU temperature",
+          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 20 },
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "fieldConfig": { "defaults": { "unit": "celsius" } },
+          "targets": [ { "refId": "A", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "expr": "mktxp_system_cpu_temperature{routerboard_name=~\"$router\"}", "legendFormat": "{{routerboard_name}}" } ]
+        }
+      ]
+    }

@@ -1,0 +1,119 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mktxp
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/name: mktxp
+    app.kubernetes.io/component: exporter
+    app.kubernetes.io/part-of: mikrotik-monitoring
+spec:
+  replicas: 1
+  # mktxp holds no state; a rolling replace is fine. One replica avoids
+  # duplicate scrapes of the same routers.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: mktxp
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: mktxp
+        app.kubernetes.io/component: exporter
+      annotations:
+        # Roll the pod automatically when the router config changes.
+        # (Replace with your own tooling if you use reloader/stakater.)
+        checksum/config: "replace-me-or-use-a-reloader"
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: mktxp
+          # Pinned to a release tag. For production, pin to the immutable
+          # digest instead: ghcr.io/akpw/mktxp@sha256:<digest>
+          image: ghcr.io/akpw/mktxp:v1.2.19
+          imagePullPolicy: IfNotPresent
+          args: ["export"]
+          env:
+            # mktxp/python write nothing to $HOME for `export`, but point it
+            # at a writable path so a read-only rootfs can't surprise us.
+            - name: HOME
+              value: /tmp
+          ports:
+            - name: metrics
+              containerPort: 49090
+              protocol: TCP
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          # mktxp scrapes routers live when /metrics is hit, which can be
+          # slow — probe the listener with TCP, not an HTTP metrics fetch,
+          # so a slow router scrape never triggers a restart.
+          startupProbe:
+            tcpSocket:
+              port: metrics
+            periodSeconds: 5
+            failureThreshold: 12
+          livenessProbe:
+            tcpSocket:
+              port: metrics
+            periodSeconds: 30
+            failureThreshold: 3
+          readinessProbe:
+            tcpSocket:
+              port: metrics
+            periodSeconds: 15
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              # No CPU limit (avoids throttling the burst scrape); cap memory.
+              memory: 256Mi
+          volumeMounts:
+            - name: mktxp-config
+              mountPath: /etc/mktxp
+              readOnly: true
+            - name: ca-trust
+              mountPath: /etc/mktxp-ca
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        # Combine the secret (router entries w/ passwords) and the configmap
+        # (global settings) into a single /etc/mktxp directory.
+        - name: mktxp-config
+          projected:
+            defaultMode: 0400
+            sources:
+              - secret:
+                  name: mktxp-routers
+                  items:
+                    - key: mktxp.conf
+                      path: mktxp.conf
+              - configMap:
+                  name: mktxp-global
+                  items:
+                    - key: _mktxp.conf
+                      path: _mktxp.conf
+        # The Let's Encrypt issuing CA chain, so mktxp can verify the
+        # routers' api-ssl certificate (ssl_ca_file in mktxp.conf points here).
+        - name: ca-trust
+          secret:
+            secretName: mikrotik-api-tls
+            optional: true
+            items:
+              - key: ca.crt
+                path: le-chain.pem
+        - name: tmp
+          emptyDir: {}

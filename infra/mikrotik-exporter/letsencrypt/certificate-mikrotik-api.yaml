@@ -1,0 +1,29 @@
+# One certificate whose SAN list covers all three routers. cert-manager
+# stores the result in the `mikrotik-api-tls` Secret (tls.crt / tls.key /
+# ca.crt) in the monitoring namespace, and renews it automatically ~30 days
+# before expiry. The cert-sync CronJob pushes each renewal onto the routers;
+# mktxp mounts ca.crt to verify the routers' api-ssl cert.
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: mikrotik-api
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/part-of: mikrotik-monitoring
+spec:
+  secretName: mikrotik-api-tls
+  duration: 2160h    # 90d
+  renewBefore: 720h  # 30d
+  privateKey:
+    algorithm: RSA
+    size: 2048        # RSA-2048: broadest RouterOS compatibility
+    rotationPolicy: Always
+  # RouterOS matches the api-ssl cert against the hostname mktxp connects to,
+  # and mktxp has ssl_check_hostname = True — so every FQDN must be a SAN.
+  dnsNames:
+    - doohickey.internal.dployr.com
+    - gizmo.internal.dployr.com
+    - gadget.internal.dployr.com
+  issuerRef:
+    name: letsencrypt-dns01
+    kind: ClusterIssuer

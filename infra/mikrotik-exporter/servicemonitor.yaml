@@ -1,0 +1,32 @@
+# Tells the Prometheus Operator (kube-prometheus-stack) to scrape mktxp.
+#
+# GOTCHA: kube-prometheus-stack's Prometheus only picks up ServiceMonitors
+# whose labels match its `serviceMonitorSelector`. The chart default selects
+# on `release: <helm-release-name>`. Set the label below to YOUR release name
+# (find it with: `helm ls -n monitoring`). If your Prometheus uses
+# `serviceMonitorSelectorNilUsesHelmValues: false` (selects all), the label
+# is harmless but not required.
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: mktxp
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/name: mktxp
+    release: kube-prometheus-stack
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: mktxp
+  endpoints:
+    - port: metrics
+      path: /metrics
+      # mktxp scrapes all routers on each hit — give it room. Keep the
+      # interval >= the time a full scrape takes, and the timeout below the
+      # total_max_scrape_duration in _mktxp.conf (90s).
+      interval: 60s
+      scrapeTimeout: 50s
+      honorLabels: true
+  namespaceSelector:
+    matchNames:
+      - monitoring
