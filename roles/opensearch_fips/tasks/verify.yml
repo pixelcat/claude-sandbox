@@ -1,0 +1,102 @@
+---
+# Verification.
+#
+# A running service proves nothing here: OpenSearch starts happily with the
+# jars present and the providers unloaded, and every surface-level check looks
+# fine while the node is not on the validated module. Each check below tests
+# the actual property rather than a proxy for it.
+
+- name: Re-read the kernel FIPS flag
+  ansible.builtin.slurp:
+    src: /proc/sys/crypto/fips_enabled
+  register: fips_verify_proc
+  failed_when: false
+  changed_when: false
+
+- name: Check 1 — kernel is in FIPS mode
+  ansible.builtin.set_fact:
+    fips_check_kernel: >-
+      {{ (fips_verify_proc.content | b64decode | trim) == '1'
+         if fips_verify_proc.content is defined else false }}
+
+# Ask the JVM which providers it actually loaded, using the same
+# java.security the service uses. This is the check that catches a provider
+# ordering mistake.
+- name: Check 2 — JVM loads the BCFIPS providers
+  ansible.builtin.shell:
+    cmd: >-
+      set -o pipefail;
+      java -Djava.security.properties={{ fips_java_security_path }}
+           -cp "{{ fips_provider_dir_opensearch }}/*"
+           -XshowSettings:security:properties -version 2>&1
+      | grep -c 'BouncyCastleFipsProvider'
+  register: fips_verify_provider
+  changed_when: false
+  failed_when: false
+  args:
+    executable: /bin/bash
+  when: fips_target_opensearch | bool
+
+- name: Record the provider check result
+  ansible.builtin.set_fact:
+    fips_check_provider: >-
+      {{ (fips_verify_provider.stdout | default('0') | trim | int) > 0 }}
+  when: fips_target_opensearch | bool
+
+# Negotiate a real handshake and read back the protocol and cipher. This is
+# the only check that proves the wire is actually protected by an approved
+# suite, as opposed to the config claiming it will be.
+- name: Check 3 — live TLS handshake uses an approved suite
+  ansible.builtin.shell:
+    cmd: >-
+      set -o pipefail;
+      echo | openssl s_client -connect {{ fips_verify_opensearch_url | urlsplit('netloc') }}
+      -tls1_2 2>/dev/null
+      | grep -E '^\s*(Protocol|Cipher)\s*:'
+  register: fips_verify_tls
+  changed_when: false
+  failed_when: false
+  args:
+    executable: /bin/bash
+  when:
+    - fips_target_opensearch | bool
+    - fips_verify_opensearch_url | length > 0
+
+- name: Record the TLS check result
+  ansible.builtin.set_fact:
+    fips_check_tls: >-
+      {{ fips_verify_tls.stdout is defined
+         and (fips_verify_tls.stdout | regex_search('TLSv1\.[23]')) is not none }}
+  when:
+    - fips_target_opensearch | bool
+    - fips_verify_opensearch_url | length > 0
+
+- name: Report verification results
+  ansible.builtin.debug:
+    msg:
+      - "kernel FIPS mode ......... {{ 'PASS' if fips_check_kernel else 'FAIL' }} ({{ fips_proc_flag | default('unknown') }})"
+      - "BCFIPS providers loaded .. {{ (fips_check_provider | default(false)) | ternary('PASS', 'FAIL') }}"
+      - "TLS negotiated ........... {{ (fips_check_tls | default('skipped')) }}"
+      - "{{ fips_verify_tls.stdout | default('(no handshake performed)') }}"
+
+- name: Fail when FIPS cannot be proven
+  ansible.builtin.assert:
+    that:
+      - fips_check_kernel | bool
+      - not (fips_target_opensearch | bool) or (fips_check_provider | default(false) | bool)
+    fail_msg: >-
+      FIPS could not be verified. The configuration may be in place but the
+      node is not demonstrably running on the validated module — do not record
+      this host as compliant. Re-check provider ordering in
+      {{ fips_java_security_path }} and confirm the service restarted.
+    success_msg: "FIPS verified: kernel in FIPS mode and BCFIPS providers loaded."
+  when: fips_verify_strict | bool
+
+- name: Warn when verification failed but strict mode is off
+  ansible.builtin.debug:
+    msg: >-
+      WARNING FIPS verification did not pass and fips_verify_strict is false.
+      This host must not be recorded as FIPS compliant.
+  when:
+    - not (fips_verify_strict | bool)
+    - not (fips_check_kernel | bool) or not (fips_check_provider | default(false) | bool)

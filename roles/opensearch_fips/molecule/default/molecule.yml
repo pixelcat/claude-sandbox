@@ -1,0 +1,30 @@
+---
+# Kernel FIPS mode cannot be exercised in a container: /proc/sys/crypto/fips_enabled
+# is host state and fips-mode-setup needs a reboot. The scenario therefore runs
+# with fips_enable_os and fips_require_os_mode disabled, and covers the layers
+# that ARE testable — assertions, template rendering, provider placement, and
+# idempotence. Kernel-level behaviour needs a VM; see molecule/vm/.
+driver:
+  name: podman
+
+platforms:
+  - name: fips-el9
+    image: quay.io/rockylinux/rockylinux:9
+    pre_build_image: true
+    command: /sbin/init
+    capabilities:
+      - SYS_ADMIN
+    volumes:
+      - /sys/fs/cgroup:/sys/fs/cgroup:ro
+
+provisioner:
+  name: ansible
+  inventory:
+    group_vars:
+      all:
+        fips_enable_os: false
+        fips_require_os_mode: false
+        fips_verify: false
+
+verifier:
+  name: ansible

@@ -1,0 +1,23 @@
+# {{ ansible_managed }}
+#
+# FIPS JVM options. Single '=' on java.security.properties overlays the JDK
+# defaults; '==' replaces them entirely and breaks unrelated JDK behaviour.
+
+-Djava.security.properties={{ fips_java_security_file }}
+
+{% if fips_approved_only | bool %}
+# Reject any algorithm outside the validated boundary at runtime rather than
+# falling back to a non-approved implementation.
+-Dorg.bouncycastle.fips.approved_only=true
+{% endif %}
+
+# Default the JSSE store types so anything not explicitly configured still
+# gets an approved container format.
+-Djavax.net.ssl.keyStoreType=BCFKS
+-Djavax.net.ssl.trustStoreType=BCFKS
+
+# The provider jars must be on the classpath before the security manager
+# resolves the providers named in java.security.
+{% for jar in fips_provider_jars %}
+-Xbootclasspath/a:{{ fips_provider_dir }}/{{ jar.src | basename }}
+{% endfor %}

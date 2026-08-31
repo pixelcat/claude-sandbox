@@ -1,0 +1,88 @@
+---
+# OS-level FIPS mode. Kernel state was read in assert.yml; this file changes it.
+
+# ------------------------------------------------------------- RedHat family
+- name: Ensure crypto-policies scripts are present
+  ansible.builtin.package:
+    name: crypto-policies-scripts
+    state: present
+  when:
+    - ansible_facts['os_family'] == 'RedHat'
+    - not fips_os_enabled
+
+- name: Enable FIPS mode
+  ansible.builtin.command: fips-mode-setup --enable
+  register: fips_setup
+  changed_when: fips_setup.rc == 0
+  when:
+    - ansible_facts['os_family'] == 'RedHat'
+    - not fips_os_enabled
+
+- name: Report that a reboot is required
+  ansible.builtin.debug:
+    msg: >-
+      FIPS mode is staged but NOT active until this host reboots. Nothing
+      cryptographic has changed yet. Reboot during a window you control —
+      a host whose SSH host keys or boot chain use non-approved algorithms
+      may not come back, and recovery needs console access.
+  when:
+    - ansible_facts['os_family'] == 'RedHat'
+    - fips_setup is changed
+    - not (fips_reboot | bool)
+
+- name: Reboot to activate FIPS mode
+  ansible.builtin.reboot:
+    reboot_timeout: "{{ fips_reboot_timeout | default(900) }}"
+    msg: "Rebooting to activate FIPS mode (ansible: opensearch_fips)"
+  when:
+    - ansible_facts['os_family'] == 'RedHat'
+    - fips_setup is changed
+    - fips_reboot | bool
+
+# --------------------------------------------------------------- Debian family
+#
+# Ubuntu FIPS ships through Ubuntu Pro and needs an attached subscription. The
+# token is a credential and enabling it changes the machine's entitlement
+# state, so the role asserts rather than enrols.
+- name: Check Ubuntu Pro FIPS status
+  ansible.builtin.command: pro status --format json
+  register: fips_pro_status
+  changed_when: false
+  failed_when: false
+  when:
+    - ansible_facts['os_family'] == 'Debian'
+    - not fips_os_enabled
+
+- name: Assert an Ubuntu Pro FIPS service is enabled
+  ansible.builtin.assert:
+    that:
+      - fips_pro_status.rc == 0
+      - (fips_pro_status.stdout | from_json).services
+        | selectattr('name', 'match', '^fips')
+        | selectattr('status', 'equalto', 'enabled')
+        | list | length > 0
+    fail_msg: >-
+      Ubuntu FIPS is not enabled. It requires an attached Ubuntu Pro
+      subscription: `pro attach <token>` then `pro enable fips-updates`,
+      followed by a reboot. The role does not handle the token, which is a
+      credential and an entitlement change.
+  when:
+    - ansible_facts['os_family'] == 'Debian'
+    - not fips_os_enabled
+
+# --------------------------------------------------------------- re-read state
+- name: Re-read the kernel FIPS flag after any change
+  ansible.builtin.slurp:
+    src: /proc/sys/crypto/fips_enabled
+  register: fips_proc_raw_post
+  failed_when: false
+  changed_when: false
+
+- name: Update recorded kernel FIPS state
+  ansible.builtin.set_fact:
+    fips_proc_flag: >-
+      {{ (fips_proc_raw_post.content | b64decode | trim)
+         if fips_proc_raw_post.content is defined else 'absent' }}
+    fips_os_enabled: >-
+      {{ (fips_proc_raw_post.content | b64decode | trim) == '1'
+         if fips_proc_raw_post.content is defined else false }}

@@ -1,0 +1,38 @@
+---
+# Logstash JVM configuration.
+#
+# Logstash reads jvm.options directly and has no drop-in directory, so the
+# settings go into a block delimited by markers. blockinfile keeps the change
+# idempotent and reversible without rewriting the vendor file.
+
+- name: Install the Logstash FIPS JVM options
+  ansible.builtin.blockinfile:
+    path: /etc/logstash/jvm.options
+    marker: "## {mark} ANSIBLE MANAGED BLOCK opensearch_fips"
+    block: |
+      -Djava.security.properties={{ fips_java_security_path_logstash }}
+      {% if fips_approved_only | bool %}
+      -Dorg.bouncycastle.fips.approved_only=true
+      {% endif %}
+      -Djavax.net.ssl.keyStoreType=BCFKS
+      -Djavax.net.ssl.trustStoreType=BCFKS
+      {% for jar in fips_provider_jars %}
+      -Xbootclasspath/a:{{ fips_provider_dir_logstash }}/{{ jar.src | basename }}
+      {% endfor %}
+    owner: root
+    group: logstash
+    mode: "0640"
+    create: false
+  notify: Restart logstash
+
+# The opensearch output plugin needs to be told the store format explicitly;
+# it defaults to a non-approved type and fails at connect time rather than at
+# startup, which makes it look like a network problem.
+- name: Note the required output-plugin settings
+  ansible.builtin.debug:
+    msg: >-
+      Logstash JVM is configured for FIPS. The opensearch output plugin also
+      needs truststore settings pointing at a BCFKS store — the role does not
+      edit pipeline configs, since those are pipeline-specific. Set
+      `truststore => "/path/store.bcfks"` and confirm the plugin negotiates
+      an approved suite before declaring this done.

@@ -1,0 +1,22 @@
+---
+galaxy_info:
+  role_name: opensearch_fips
+  author: platform
+  description: >-
+    Configure FIPS 140-3 mode for OpenSearch and Logstash: OS FIPS mode, the
+    BouncyCastle FIPS provider, BCFKS keystores, and approved TLS suites.
+  license: MIT
+  min_ansible_version: "2.14"
+  platforms:
+    - name: EL
+      versions: ["8", "9"]
+    - name: Ubuntu
+      versions: ["focal", "jammy", "noble"]
+  galaxy_tags:
+    - fips
+    - opensearch
+    - logstash
+    - security
+    - compliance
+
+dependencies: []

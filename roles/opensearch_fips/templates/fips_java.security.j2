@@ -1,0 +1,36 @@
+#
+# {{ ansible_managed }}
+#
+# FIPS java.security overlay. Applied with -Djava.security.properties=<path>
+# (single '=' overlays the JDK defaults; '==' would replace them wholesale and
+# strip settings the JDK needs).
+#
+# Provider order is load-bearing. BCFIPS must precede the stock providers or
+# the JVM silently keeps using SunJCE and nothing is running on the validated
+# module, while every surface-level check still looks fine.
+
+security.provider.1=org.bouncycastle.jcajce.provider.BouncyCastleFipsProvider
+security.provider.2=org.bouncycastle.jsse.provider.BouncyCastleJsseProvider fips:BCFIPS
+security.provider.3=sun.security.provider.Sun
+
+# JKS and PKCS12 are not approved container formats. BCFKS is.
+keystore.type=BCFKS
+keystore.type.compat=false
+
+ssl.KeyManagerFactory.algorithm=PKIX
+ssl.TrustManagerFactory.algorithm=PKIX
+
+# Non-approved algorithms are rejected outright rather than downgraded.
+jdk.tls.disabledAlgorithms=SSLv3, TLSv1, TLSv1.1, RC4, DES, MD5withRSA, \
+    DH keySize < 2048, EC keySize < 224, 3DES_EDE_CBC, anon, NULL
+
+jdk.certpath.disabledAlgorithms=MD2, MD5, SHA1 jdkCA & usage TLSServer, \
+    RSA keySize < 2048, DSA keySize < 2048, EC keySize < 224
+
+# Approved TLS versions only.
+jdk.tls.client.protocols={{ fips_tls_protocols | join(',') }}
+jdk.tls.server.protocols={{ fips_tls_protocols | join(',') }}
+
+# Seed from the kernel entropy source; the JVM's own fallback is not approved.
+securerandom.source=file:/dev/urandom
+securerandom.strongAlgorithms=DEFAULT:BCFIPS

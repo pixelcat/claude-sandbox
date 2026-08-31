@@ -1,0 +1,8 @@
+---
+# Internal values. Override in defaults/ or group_vars, not here.
+
+# Set by tasks/assert.yml from /proc/sys/crypto/fips_enabled. Declared with
+# safe fallbacks so templates and conditionals never hit an undefined variable
+# when a block is skipped.
+fips_proc_flag: "unknown"
+fips_os_enabled: false

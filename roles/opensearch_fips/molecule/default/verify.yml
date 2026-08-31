@@ -1,0 +1,69 @@
+---
+- name: Verify
+  hosts: all
+  become: true
+  tasks:
+    - name: The java.security overlay exists
+      ansible.builtin.stat:
+        path: /etc/opensearch/fips_java.security
+      register: js
+
+    - name: Assert the overlay was written
+      ansible.builtin.assert:
+        that: js.stat.exists
+
+    - name: Read the overlay
+      ansible.builtin.slurp:
+        src: /etc/opensearch/fips_java.security
+      register: js_content
+
+    # Provider ORDER is the property that matters. A file containing the right
+    # provider names in the wrong order passes a naive grep and leaves the JVM
+    # on SunJCE, so assert the index explicitly.
+    - name: Assert BCFIPS is provider 1 and BCJSSE is provider 2
+      ansible.builtin.assert:
+        that:
+          - "'security.provider.1=org.bouncycastle.jcajce.provider.BouncyCastleFipsProvider'
+             in (js_content.content | b64decode)"
+          - "'security.provider.2=org.bouncycastle.jsse.provider.BouncyCastleJsseProvider'
+             in (js_content.content | b64decode)"
+
+    - name: Assert BCFKS is the default keystore type
+      ansible.builtin.assert:
+        that:
+          - "'keystore.type=BCFKS' in (js_content.content | b64decode)"
+          - "'keystore.type.compat=false' in (js_content.content | b64decode)"
+
+    - name: Assert TLS 1.0 and 1.1 are disabled
+      ansible.builtin.assert:
+        that:
+          - "'TLSv1,' in (js_content.content | b64decode)"
+          - "'TLSv1.1' in (js_content.content | b64decode)"
+
+    - name: The JVM options drop-in exists
+      ansible.builtin.slurp:
+        src: /etc/opensearch/jvm.options.d/fips.options
+      register: jvm_opts
+
+    - name: Assert approved_only is enforced
+      ansible.builtin.assert:
+        that:
+          - "'-Dorg.bouncycastle.fips.approved_only=true' in (jvm_opts.content | b64decode)"
+
+    # A single '=' overlays the JDK defaults; '==' replaces them and breaks
+    # unrelated JDK behaviour. Guard against that regression.
+    - name: Assert java.security.properties uses a single equals
+      ansible.builtin.assert:
+        that:
+          - "'-Djava.security.properties=/etc/opensearch/fips_java.security'
+             in (jvm_opts.content | b64decode)"
+          - "'-Djava.security.properties==' not in (jvm_opts.content | b64decode)"
+
+    - name: Assert provider jars were installed
+      ansible.builtin.stat:
+        path: "/usr/share/opensearch/plugins/opensearch-security/{{ item }}"
+      register: jar_stat
+      failed_when: not jar_stat.stat.exists
+      loop:
+        - bc-fips-2.0.0.jar
+        - bctls-fips-2.0.19.jar

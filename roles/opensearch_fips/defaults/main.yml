@@ -1,0 +1,99 @@
+---
+# opensearch_fips — defaults
+#
+# Every destructive or reboot-inducing action is opt-in. The role is safe to
+# run in check mode against a production node with these defaults.
+
+# ----------------------------------------------------------------- scope
+# Which JVM services to configure. Both share the same provider mechanism,
+# so enabling both is normal on a combined node.
+fips_target_opensearch: true
+fips_target_logstash: false
+
+# ------------------------------------------------------------ OS FIPS mode
+# Enabling OS FIPS mode requires a reboot and can render a host unreachable
+# if SSH host keys or the boot chain use non-approved algorithms. The reboot
+# is therefore never automatic.
+fips_enable_os: true
+fips_reboot: false
+
+# Refuse to configure the JVM layer while the kernel is not in FIPS mode.
+# Setting this false lets you stage the JVM config ahead of the reboot.
+fips_require_os_mode: true
+
+# ------------------------------------------------- BouncyCastle FIPS provider
+#
+# These jars are the validated cryptographic module. They are NOT fetched from
+# the internet: under a compliance boundary the artefacts must come from an
+# internal, checksum-verified source. Provide absolute paths on the control
+# node, or a URL to an internal artefact store.
+#
+# Required: bc-fips (the module) and bctls-fips (the JSSE provider).
+# bcpkix-fips and bcutil-fips are needed for keystore and certificate work.
+#
+#   fips_provider_jars:
+#     - src: files/bc-fips-2.0.0.jar
+#       sha256: "…"
+#     - src: files/bctls-fips-2.0.19.jar
+#       sha256: "…"
+fips_provider_jars: []
+
+# Where the jars land. Both services get their own copy so a package upgrade
+# of one cannot strip the other's provider.
+fips_provider_dir_opensearch: /usr/share/opensearch/plugins/opensearch-security/
+fips_provider_dir_logstash: /usr/share/logstash/vendor/jar/fips/
+
+# ------------------------------------------------------------ java.security
+fips_java_security_path: /etc/opensearch/fips_java.security
+fips_java_security_path_logstash: /etc/logstash/fips_java.security
+
+# approved_only rejects any algorithm outside the validated boundary at
+# runtime. Turning it off makes the module non-compliant; it exists only as a
+# diagnostic escape hatch.
+fips_approved_only: true
+
+# ---------------------------------------------------------------- keystores
+#
+# JKS and PKCS12 are not FIPS-approved container formats. Existing stores must
+# be converted to BCFKS. Conversion writes a NEW file and never deletes the
+# source, so a failed conversion is recoverable.
+#
+#   fips_keystores:
+#     - src: /etc/opensearch/certs/node.p12
+#       src_type: PKCS12
+#       dest: /etc/opensearch/certs/node.bcfks
+#       password_var: opensearch_keystore_password
+fips_keystores: []
+
+fips_keystore_owner: opensearch
+fips_keystore_group: opensearch
+fips_keystore_mode: "0600"
+
+# ---------------------------------------------------------------------- TLS
+# Restricted to the suites that remain approved under FIPS 140-3. Anything
+# outside this list will fail the handshake once approved_only is set, so
+# narrowing here surfaces the problem at config time instead of at runtime.
+fips_tls_protocols:
+  - TLSv1.3
+  - TLSv1.2
+
+fips_tls_cipher_suites:
+  - TLS_AES_256_GCM_SHA384
+  - TLS_AES_128_GCM_SHA256
+  - TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384
+  - TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384
+  - TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256
+  - TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256
+
+# --------------------------------------------------------------- verification
+# Verification runs by default. It proves the provider loads and the kernel
+# flag is set rather than inferring success from "the service started".
+fips_verify: true
+
+# Fail the play when verification cannot prove FIPS is active. Setting this
+# false downgrades a failed proof to a warning — useful while staging, wrong
+# for a compliance run.
+fips_verify_strict: true
+
+# Service endpoints for the live TLS check. Empty disables that check.
+fips_verify_opensearch_url: "https://127.0.0.1:9200"

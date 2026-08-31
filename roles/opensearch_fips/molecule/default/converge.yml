@@ -1,0 +1,33 @@
+---
+- name: Converge
+  hosts: all
+  become: true
+  pre_tasks:
+    - name: Install java and openssl for keytool and handshake checks
+      ansible.builtin.package:
+        name:
+          - java-17-openjdk-headless
+          - openssl
+        state: present
+
+    - name: Stage fake provider jars
+      ansible.builtin.copy:
+        content: "not a real jar"
+        dest: "/tmp/{{ item }}"
+        mode: "0644"
+      loop:
+        - bc-fips-2.0.0.jar
+        - bctls-fips-2.0.19.jar
+
+  tasks:
+    - name: Include the role
+      ansible.builtin.include_role:
+        name: opensearch_fips
+      vars:
+        fips_target_opensearch: true
+        fips_target_logstash: false
+        fips_provider_jars:
+          - src: /tmp/bc-fips-2.0.0.jar
+            sha256: "{{ lookup('pipe', 'sha256sum /tmp/bc-fips-2.0.0.jar').split()[0] }}"
+          - src: /tmp/bctls-fips-2.0.19.jar
+            sha256: "{{ lookup('pipe', 'sha256sum /tmp/bctls-fips-2.0.19.jar').split()[0] }}"

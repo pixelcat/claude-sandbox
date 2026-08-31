@@ -1,0 +1,19 @@
+---
+# Both handlers are listened for by tasks that may run when only one service is
+# targeted, so each is guarded rather than assuming the unit exists.
+
+- name: Restart opensearch
+  ansible.builtin.systemd_service:
+    name: opensearch
+    state: restarted
+    daemon_reload: true
+  when: fips_target_opensearch | bool
+  listen: Restart opensearch
+
+- name: Restart logstash
+  ansible.builtin.systemd_service:
+    name: logstash
+    state: restarted
+    daemon_reload: true
+  when: fips_target_logstash | bool
+  listen: Restart logstash

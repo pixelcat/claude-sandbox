@@ -1,0 +1,73 @@
+---
+# OpenSearch JVM and security-plugin configuration.
+#
+# The jvm.options.d drop-in directory is used rather than editing jvm.options,
+# so a package upgrade cannot silently revert the settings.
+
+- name: Ensure the OpenSearch jvm.options.d directory exists
+  ansible.builtin.file:
+    path: /etc/opensearch/jvm.options.d
+    state: directory
+    owner: root
+    group: opensearch
+    mode: "0750"
+
+- name: Install the OpenSearch FIPS JVM options
+  ansible.builtin.template:
+    src: jvm-fips.options.j2
+    dest: /etc/opensearch/jvm.options.d/fips.options
+    owner: root
+    group: opensearch
+    mode: "0640"
+  vars:
+    fips_java_security_file: "{{ fips_java_security_path }}"
+    fips_provider_dir: "{{ fips_provider_dir_opensearch }}"
+  notify: Restart opensearch
+
+# Keystore types must be declared explicitly. The security plugin defaults to
+# JKS, which the provider will refuse once approved_only is set — and the
+# resulting startup error names the file, not the format, which sends people
+# looking in the wrong place.
+- name: Set BCFKS keystore types in opensearch.yml
+  ansible.builtin.lineinfile:
+    path: /etc/opensearch/opensearch.yml
+    regexp: "^{{ item.key | regex_escape() }}:"
+    line: "{{ item.key }}: {{ item.value }}"
+    owner: root
+    group: opensearch
+    mode: "0660"
+    create: false
+  loop:
+    - key: plugins.security.ssl.transport.keystore_type
+      value: BCFKS
+    - key: plugins.security.ssl.transport.truststore_type
+      value: BCFKS
+    - key: plugins.security.ssl.http.keystore_type
+      value: BCFKS
+    - key: plugins.security.ssl.http.truststore_type
+      value: BCFKS
+  loop_control:
+    label: "{{ item.key }}"
+  notify: Restart opensearch
+
+- name: Restrict TLS protocols and cipher suites in opensearch.yml
+  ansible.builtin.lineinfile:
+    path: /etc/opensearch/opensearch.yml
+    regexp: "^{{ item.key | regex_escape() }}:"
+    line: "{{ item.key }}: {{ item.value | to_json }}"
+    owner: root
+    group: opensearch
+    mode: "0660"
+    create: false
+  loop:
+    - key: plugins.security.ssl.transport.enabled_protocols
+      value: "{{ fips_tls_protocols }}"
+    - key: plugins.security.ssl.transport.enabled_ciphers
+      value: "{{ fips_tls_cipher_suites }}"
+    - key: plugins.security.ssl.http.enabled_protocols
+      value: "{{ fips_tls_protocols }}"
+    - key: plugins.security.ssl.http.enabled_ciphers
+      value: "{{ fips_tls_cipher_suites }}"
+  loop_control:
+    label: "{{ item.key }}"
+  notify: Restart opensearch

@@ -1,0 +1,64 @@
+---
+# Install the BouncyCastle FIPS provider and point the JVM at it.
+#
+# Two things have to be true for the JVM to be operating on the validated
+# module: the jars are on the classpath, and java.security lists the BCFIPS
+# providers ahead of the stock ones. Doing only the first is the common
+# failure — the jars sit there and the JVM keeps using SunJCE.
+
+- name: Build the list of provider target directories
+  ansible.builtin.set_fact:
+    fips_provider_dirs: >-
+      {{ ([fips_provider_dir_opensearch] if fips_target_opensearch | bool else [])
+       + ([fips_provider_dir_logstash] if fips_target_logstash | bool else []) }}
+
+- name: Ensure provider directories exist
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  loop: "{{ fips_provider_dirs }}"
+
+# The checksum is verified by copy itself: a mismatch fails the task, so an
+# unverified artefact can never land on the host.
+- name: Install provider jars
+  ansible.builtin.copy:
+    src: "{{ item.0.src }}"
+    dest: "{{ item.1 }}/{{ item.0.src | basename }}"
+    checksum: "{{ item.0.sha256 }}"
+    owner: root
+    group: root
+    mode: "0644"
+  loop: "{{ fips_provider_jars | product(fips_provider_dirs) | list }}"
+  loop_control:
+    label: "{{ item.0.src | basename }} -> {{ item.1 }}"
+  notify:
+    - Restart opensearch
+    - Restart logstash
+
+- name: Install the FIPS java.security for OpenSearch
+  ansible.builtin.template:
+    src: fips_java.security.j2
+    dest: "{{ fips_java_security_path }}"
+    owner: root
+    group: "{{ fips_keystore_group }}"
+    mode: "0644"
+    validate: "grep -q '^security.provider.1=org.bouncycastle' %s && true"
+  vars:
+    fips_provider_dir: "{{ fips_provider_dir_opensearch }}"
+  when: fips_target_opensearch | bool
+  notify: Restart opensearch
+
+- name: Install the FIPS java.security for Logstash
+  ansible.builtin.template:
+    src: fips_java.security.j2
+    dest: "{{ fips_java_security_path_logstash }}"
+    owner: root
+    group: logstash
+    mode: "0644"
+  vars:
+    fips_provider_dir: "{{ fips_provider_dir_logstash }}"
+  when: fips_target_logstash | bool
+  notify: Restart logstash

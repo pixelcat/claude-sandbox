@@ -1,0 +1,103 @@
+---
+# Read kernel FIPS state up front so the facts exist regardless of which later
+# blocks are skipped. /proc/sys/crypto/fips_enabled is the authoritative
+# answer; fips-mode-setup --check reports intent, which differs from state
+# between the config change and the reboot.
+- name: Read the kernel FIPS flag
+  ansible.builtin.slurp:
+    src: /proc/sys/crypto/fips_enabled
+  register: fips_proc_raw
+  failed_when: false
+  changed_when: false
+
+- name: Record kernel FIPS state
+  ansible.builtin.set_fact:
+    fips_proc_flag: >-
+      {{ (fips_proc_raw.content | b64decode | trim)
+         if fips_proc_raw.content is defined else 'absent' }}
+    fips_os_enabled: >-
+      {{ (fips_proc_raw.content | b64decode | trim) == '1'
+         if fips_proc_raw.content is defined else false }}
+
+- name: Assert a supported platform
+  ansible.builtin.assert:
+    that:
+      - ansible_facts['os_family'] in ['RedHat', 'Debian']
+    fail_msg: >-
+      Unsupported OS family '{{ ansible_facts['os_family'] }}'. FIPS enablement
+      differs materially per distribution; add explicit support rather than
+      assuming the RedHat path works.
+
+- name: Assert at least one target service is selected
+  ansible.builtin.assert:
+    that:
+      - fips_target_opensearch | bool or fips_target_logstash | bool
+    fail_msg: "Neither fips_target_opensearch nor fips_target_logstash is set."
+
+- name: Assert the provider jars are supplied
+  ansible.builtin.assert:
+    that:
+      - fips_provider_jars | length > 0
+    fail_msg: >-
+      fips_provider_jars is empty. The BouncyCastle FIPS jars are the validated
+      cryptographic module and must be supplied from an internal, checksum-
+      verified source. See the role README.
+
+# A jar without a checksum cannot be shown to be the validated artefact, which
+# is the entire point of the exercise.
+- name: Assert every provider jar carries a checksum
+  ansible.builtin.assert:
+    that:
+      - item.sha256 is defined
+      - item.sha256 | length == 64
+    fail_msg: >-
+      Provider jar '{{ item.src | default('<unnamed>') }}' has no valid sha256.
+      An unverified jar cannot be attested as the validated module.
+  loop: "{{ fips_provider_jars }}"
+  loop_control:
+    label: "{{ item.src | default('<unnamed>') }}"
+
+- name: Assert bc-fips and bctls-fips are both present
+  ansible.builtin.assert:
+    that:
+      - fips_provider_jars | map(attribute='src') | map('basename') | select('match', '^bc-fips') | list | length > 0
+      - fips_provider_jars | map(attribute='src') | map('basename') | select('match', '^bctls-fips') | list | length > 0
+    fail_msg: >-
+      Both bc-fips (the module) and bctls-fips (the JSSE provider) are
+      required. TLS will fall back to a non-approved provider without bctls.
+
+- name: Assert keystore entries are complete
+  ansible.builtin.assert:
+    that:
+      - item.src is defined
+      - item.dest is defined
+      - item.src_type | default('PKCS12') in ['PKCS12', 'JKS']
+      - item.password_var is defined
+    fail_msg: "Keystore entry {{ item | to_json }} is incomplete."
+  loop: "{{ fips_keystores }}"
+  loop_control:
+    label: "{{ item.src | default('<unnamed>') }}"
+  when: fips_keystores | length > 0
+
+# Passwords are referenced by variable name so the value itself never appears
+# in the play's arguments, where it would be logged by callback plugins.
+- name: Assert referenced keystore passwords are defined
+  ansible.builtin.assert:
+    that:
+      - vars[item.password_var] is defined
+    fail_msg: >-
+      Keystore password variable '{{ item.password_var }}' is not defined.
+      Supply it from vault; do not inline the value.
+  loop: "{{ fips_keystores }}"
+  loop_control:
+    label: "{{ item.password_var }}"
+  no_log: true
+  when: fips_keystores | length > 0
+
+- name: Warn when approved-only enforcement is disabled
+  ansible.builtin.debug:
+    msg: >-
+      WARNING fips_approved_only is false. The JVM will accept algorithms
+      outside the validated boundary and the node is NOT FIPS compliant.
+      This setting is a diagnostic escape hatch only.
+  when: not (fips_approved_only | bool)

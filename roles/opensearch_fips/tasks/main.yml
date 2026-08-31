@@ -1,0 +1,52 @@
+---
+- name: Validate inputs and platform
+  ansible.builtin.import_tasks: assert.yml
+  tags: [fips, fips_assert]
+
+- name: Configure OS FIPS mode
+  ansible.builtin.import_tasks: os.yml
+  when: fips_enable_os | bool
+  tags: [fips, fips_os]
+
+# Everything below configures the JVM layer. It is pointless — and misleading
+# on an audit report — to install a validated provider on a kernel that is not
+# itself in FIPS mode, so the gate is checked once here rather than repeated.
+- name: Confirm kernel FIPS mode before configuring the JVM layer
+  ansible.builtin.assert:
+    that:
+      - fips_os_enabled | bool
+    fail_msg: >-
+      Kernel is not in FIPS mode ({{ fips_proc_flag }}). Reboot to apply
+      fips-mode-setup, or set fips_require_os_mode=false to stage the JVM
+      configuration ahead of the reboot.
+    success_msg: "Kernel FIPS mode active."
+  when: fips_require_os_mode | bool
+  tags: [fips]
+
+- name: Install the FIPS cryptographic provider
+  ansible.builtin.import_tasks: provider.yml
+  tags: [fips, fips_provider]
+
+- name: Convert keystores to BCFKS
+  ansible.builtin.import_tasks: keystores.yml
+  when: fips_keystores | length > 0
+  tags: [fips, fips_keystores]
+
+- name: Configure OpenSearch
+  ansible.builtin.import_tasks: opensearch.yml
+  when: fips_target_opensearch | bool
+  tags: [fips, fips_opensearch]
+
+- name: Configure Logstash
+  ansible.builtin.import_tasks: logstash.yml
+  when: fips_target_logstash | bool
+  tags: [fips, fips_logstash]
+
+- name: Flush handlers so verification runs against the restarted services
+  ansible.builtin.meta: flush_handlers
+  tags: [fips]
+
+- name: Verify FIPS is actually in effect
+  ansible.builtin.import_tasks: verify.yml
+  when: fips_verify | bool
+  tags: [fips, fips_verify]
